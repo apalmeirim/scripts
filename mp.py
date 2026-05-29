@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+Merge tracks from all of your Spotify playlists into one destination playlist.
++ deduplicates tracks by Spotify track ID.
+
+Setup:
+1. Create a Spotify app at https://developer.spotify.com/dashboard
+2. Set redirect URI in app settings (recommended example: http://127.0.0.1:8888/callback)
+3. Create a local `.env` file in this folder with:
+   SPOTIPY_CLIENT_ID=...
+   SPOTIPY_CLIENT_SECRET=...
+   SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+4. Install dependency (required!): pip install spotipy
+
+Ex.:
+python mp.py --target-name "mp_result"
+
+Flags:
+--target-name "NAME"       Destination playlist name (overrides USER_CONFIG target).
+--public                   Create target as public if it does not already exist.
+--include-target-source    Include target when scanning source playlists (merge mode).
+--skip-dedup-target        Skip deduplication pass on target playlist.
+--dedup-only               Skip merge/add; only deduplicate the target playlist.
+--shuffle                  Shuffle the final target playlist order.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import os
+import random
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+
+SCOPES = (
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "playlist-modify-private "
+    "playlist-modify-public"
+)
+
+# MANDATORY: Fill these values with your Spotify app credentials.
+USER_CONFIG = {
+    "target_name": "mp_result",  # Your playlist name
+    "public_target_if_created": False,
+}
+
+def load_env_file(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def chunked(items: List[str], size: int) -> Iterable[List[str]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def resolve_config_value(env_key: str, config_key: str) -> str:
+    value = os.getenv(env_key, "").strip()
+    if value:
+        return value
+    return str(USER_CONFIG.get(config_key, "")).strip()
+
+
+def get_spotify_client() -> spotipy.Spotify:
+    client_id = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
+    client_secret = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
+    redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
+
+    missing = []
+    if not client_id:
+        missing.append("client_id")
+    if not client_secret:
+        missing.append("client_secret")
+    if not redirect_uri:
+        missing.append("redirect_uri")
+    if missing:
+        raise ValueError(
+            "Missing Spotify auth config: "
+            + ", ".join(missing)
+            + ". Fill .env (or OS env vars) with SPOTIPY_* values."
+        )
+
+    auth = SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        scope=SCOPES,
+        open_browser=True,
+    )
+    return spotipy.Spotify(auth_manager=auth)
+
+
+def get_all_user_playlists(sp: spotipy.Spotify) -> List[dict]:
+    playlists: List[dict] = []
+    results = sp.current_user_playlists(limit=50)
+    playlists.extend(results.get("items", []))
+    while results.get("next"):
+        results = sp.next(results)
+        playlists.extend(results.get("items", []))
+    return playlists
+
+
+def find_playlist_by_name(playlists: List[dict], name: str) -> Optional[dict]:
+    lname = name.strip().lower()
+    for playlist in playlists:
+        if playlist.get("name", "").strip().lower() == lname:
+            return playlist
+    return None
+
+
+def get_or_create_target_playlist(sp: spotipy.Spotify, target_name: str, public: bool) -> dict:
+    playlists = get_all_user_playlists(sp)
+    existing = find_playlist_by_name(playlists, target_name)
+    if existing:
+        return existing
+
+    user = sp.current_user()
+    return sp.user_playlist_create(
+        user=user["id"],
+        name=target_name,
+        public=public,
+        description="Auto-generated playlist that merges all playlists and deduplicates tracks.",
+    )
+
+
+def extract_track_uri_and_id(item: dict) -> Tuple[Optional[str], Optional[str]]:
+    track = item.get("track")
+    if not track:
+        return None, None
+
+    track_id = track.get("id")
+    uri = track.get("uri")
+    if not track_id and uri and uri.startswith("spotify:track:"):
+        track_id = uri.split(":")[-1]
+
+    if not uri and track_id:
+        uri = f"spotify:track:{track_id}"
+
+    return uri, track_id
+
+
+def get_playlist_tracks_with_positions(sp: spotipy.Spotify, playlist_id: str) -> List[Tuple[int, str, str]]:
+    """Returns (position, uri, track_id) for tracks in a playlist."""
+    rows: List[Tuple[int, str, str]] = []
+    offset = 0
+
+    while True:
+        results = sp.playlist_items(
+            playlist_id,
+            offset=offset,
+            limit=100,
+            fields="items(track(id,uri)),next",
+        )
+        items = results.get("items", [])
+        for idx, item in enumerate(items):
+            uri, track_id = extract_track_uri_and_id(item)
+            if uri and track_id:
+                rows.append((offset + idx, uri, track_id))
+
+        if not results.get("next"):
+            break
+        offset += len(items)
+
+    return rows
+
+
+def get_unique_source_track_uris(
+    sp: spotipy.Spotify,
+    playlists: List[dict],
+    skip_playlist_ids: Set[str],
+) -> List[str]:
+    seen_ids: Set[str] = set()
+    unique_uris: List[str] = []
+
+    for playlist in playlists:
+        pid = playlist.get("id")
+        if not pid or pid in skip_playlist_ids:
+            continue
+
+        offset = 0
+        while True:
+            results = sp.playlist_items(
+                pid,
+                offset=offset,
+                limit=100,
+                fields="items(track(id,uri,is_local)),next",
+            )
+            items = results.get("items", [])
+            for item in items:
+                track = item.get("track")
+                if not track or track.get("is_local"):
+                    continue
+                uri, track_id = extract_track_uri_and_id(item)
+                if not uri or not track_id:
+                    continue
+                if track_id in seen_ids:
+                    continue
+                seen_ids.add(track_id)
+                unique_uris.append(uri)
+
+            if not results.get("next"):
+                break
+            offset += len(items)
+
+    return unique_uris
+
+
+def add_missing_tracks_to_target(
+    sp: spotipy.Spotify, target_playlist_id: str, source_unique_uris: List[str]
+) -> int:
+    target_rows = get_playlist_tracks_with_positions(sp, target_playlist_id)
+    target_ids = {track_id for _, _, track_id in target_rows}
+
+    to_add: List[str] = []
+    for uri in source_unique_uris:
+        track_id = uri.split(":")[-1]
+        if track_id not in target_ids:
+            to_add.append(uri)
+
+    for batch in chunked(to_add, 100):
+        sp.playlist_add_items(target_playlist_id, batch)
+
+    return len(to_add)
+
+
+def dedup_playlist_in_place(sp: spotipy.Spotify, playlist_id: str) -> int:
+    rows = get_playlist_tracks_with_positions(sp, playlist_id)
+    seen: Set[str] = set()
+    duplicates_by_uri: Dict[str, List[int]] = defaultdict(list)
+
+    for position, uri, track_id in rows:
+        if track_id in seen:
+            duplicates_by_uri[uri].append(position)
+        else:
+            seen.add(track_id)
+
+    total_removed = 0
+    removals: List[dict] = []
+    for uri, positions in duplicates_by_uri.items():
+        for pos in positions:
+            removals.append({"uri": uri, "positions": [pos]})
+
+    for batch in chunked(removals, 100):
+        sp.playlist_remove_specific_occurrences_of_items(playlist_id, batch)
+        total_removed += len(batch)
+
+    return total_removed
+
+
+def shuffle_playlist_in_place(sp: spotipy.Spotify, playlist_id: str) -> int:
+    rows = get_playlist_tracks_with_positions(sp, playlist_id)
+    uris = [uri for _, uri, _ in rows]
+    if len(uris) < 2:
+        return 0
+
+    random.shuffle(uris)
+    sp.playlist_replace_items(playlist_id, uris[:100])
+    for batch in chunked(uris[100:], 100):
+        sp.playlist_add_items(playlist_id, batch)
+    return len(uris)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Merge all Spotify playlists into a target playlist and deduplicate tracks."
+    )
+    parser.add_argument(
+        "--target-name",
+        help="Destination playlist name (created if it does not exist).",
+    )
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="Create target playlist as public if it does not already exist.",
+    )
+    parser.add_argument(
+        "--include-target-source",
+        action="store_true",
+        help="Include target playlist while scanning sources (normally skipped).",
+    )
+    parser.add_argument(
+        "--skip-dedup-target",
+        action="store_true",
+        help="Skip deduplicating duplicate tracks already in target.",
+    )
+    parser.add_argument(
+        "--dedup-only",
+        action="store_true",
+        help="Only deduplicate the target playlist (skip merge/add step).",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle the final target playlist order.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    load_env_file()
+    sp = get_spotify_client()
+    target_name = args.target_name or str(USER_CONFIG.get("target_name", "")).strip()
+    if not target_name:
+        raise ValueError("No target playlist name set. Use --target-name or USER_CONFIG['target_name'].")
+    public_if_created = args.public or bool(USER_CONFIG.get("public_target_if_created", False))
+
+    all_playlists = get_all_user_playlists(sp)
+    target = get_or_create_target_playlist(sp, target_name, public=public_if_created)
+    target_id = target["id"]
+
+    source_uris: List[str] = []
+    added_count = 0
+    if not args.dedup_only:
+        skip_ids = set()
+        if not args.include_target_source:
+            skip_ids.add(target_id)
+        source_uris = get_unique_source_track_uris(sp, all_playlists, skip_ids)
+        added_count = add_missing_tracks_to_target(sp, target_id, source_uris)
+
+    removed_count = 0
+    if not args.skip_dedup_target:
+        removed_count = dedup_playlist_in_place(sp, target_id)
+    shuffled_count = 0
+    if args.shuffle:
+        shuffled_count = shuffle_playlist_in_place(sp, target_id)
+
+    print(f"Target playlist: {target.get('name')} ({target_id})")
+    print(f"Unique tracks found across source playlists: {len(source_uris)}")
+    print(f"Tracks added to target: {added_count}")
+    print(f"Duplicate entries removed from target: {removed_count}")
+    print(f"Tracks shuffled in target: {shuffled_count}")
+
+
+if __name__ == "__main__":
+    main()

@@ -34,7 +34,7 @@ def should_skip(path: Path) -> bool:
     return False
 
 def debug_changes(filename, text_before, text_after):
-    print(f"\n🔍 Checking {filename}")
+    print(f"\nChecking {filename}")
     count = 0
     for i, (a, b) in enumerate(zip(text_before.splitlines(), text_after.splitlines()), start=1):
         if a != b:
@@ -66,11 +66,11 @@ def process_file(f: Path):
         debug_changes(f, orig, text)
         if not DRY_RUN:
             f.write_text(text, encoding='utf-8')
-            print(f"✔ Saved {f}")
+            print(f"Saved {f}")
         else:
-            print(f"💡 Dry-run: would modify {f}")
+            print(f"Dry-run: would modify {f}")
     else:
-        print(f"✔ No changes in {f}")
+        print(f"No changes in {f}")
 
 # run
 if __name__ == "__main__":
@@ -78,4 +78,4 @@ if __name__ == "__main__":
         process_file(f)
 
     if DRY_RUN:
-        print("\n💭 Dry-run mode ON — set DRY_RUN = False to actually save changes.")
+        print("\nDry-run mode ON — set DRY_RUN = False to actually save changes.")
