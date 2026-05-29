@@ -22,21 +22,27 @@ flags:
 --skip-dedup-target        skip deduplication pass on target playlist.
 --dedup-only               skip merge/add; only deduplicate the target playlist.
 --shuffle                  shuffle the final target playlist order.
+--cover-image "file.jpg"   set target playlist cover image from a JPEG in this script directory.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import defaultdict
+from datetime import date
 import os
+from pathlib import Path
 import random
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.exceptions import SpotifyException
 
 
 SCOPES = (
+    "ugc-image-upload "
     "playlist-read-private "
     "playlist-read-collaborative "
     "playlist-modify-private "
@@ -45,9 +51,42 @@ SCOPES = (
 
 # mandatory: fill these values with your spotify app credentials.
 USER_CONFIG = {
-    "target_name": "mp_result",  # your playlist name
+    "target_name": "",  # optional override; defaults to today's date if left empty
     "public_target_if_created": False,
 }
+
+
+def default_target_name() -> str:
+    return date.today().isoformat()
+
+
+def resolve_cover_image_path(image_name: str) -> Path:
+    script_dir = Path(__file__).resolve().parent
+    image_path = (script_dir / image_name).resolve()
+    if image_path.parent != script_dir:
+        raise ValueError("Cover image must be a file in this script directory.")
+    if not image_path.exists() or not image_path.is_file():
+        raise ValueError(f"Cover image not found in script directory: {image_path.name}")
+    if image_path.suffix.lower() not in {".jpg", ".jpeg"}:
+        raise ValueError("Cover image must be a .jpg or .jpeg file.")
+    if image_path.stat().st_size > 256 * 1024:
+        raise ValueError("Cover image must be 256KB or smaller.")
+    data = image_path.read_bytes()
+    # Basic JPEG signature check: SOI marker and EOI marker.
+    if len(data) < 4 or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9"):
+        raise ValueError("Cover image bytes are not a valid JPEG. Re-export as baseline JPEG.")
+    return image_path
+
+
+def set_playlist_cover_image(sp: spotipy.Spotify, playlist_id: str, image_path: Path) -> None:
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    try:
+        sp.playlist_upload_cover_image(playlist_id, image_b64)
+    except SpotifyException as ex:
+        raise ValueError(
+            "Spotify rejected the cover image (HTTP 400). "
+            "Use a real JPEG (not PNG renamed to .jpg), keep it <=256KB, and re-export as baseline JPEG."
+        ) from ex
 
 def load_env_file(path: str = ".env") -> None:
     if not os.path.exists(path):
@@ -134,7 +173,7 @@ def get_or_create_target_playlist(sp: spotipy.Spotify, target_name: str, public:
         user=user["id"],
         name=target_name,
         public=public,
-        description="Auto-generated playlist that merges all playlists and deduplicates tracks.",
+        description="generated playlist that merges all playlists and deduplicates tracks.",
     )
 
 
@@ -308,6 +347,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shuffle the final target playlist order.",
     )
+    parser.add_argument(
+        "--cover-image",
+        help="JPEG filename in this script directory to set as playlist cover (e.g. cover.jpg).",
+    )
     return parser.parse_args()
 
 
@@ -315,14 +358,15 @@ def main() -> None:
     args = parse_args()
     load_env_file()
     sp = get_spotify_client()
-    target_name = args.target_name or str(USER_CONFIG.get("target_name", "")).strip()
-    if not target_name:
-        raise ValueError("No target playlist name set. Use --target-name or USER_CONFIG['target_name'].")
+    target_name = args.target_name or str(USER_CONFIG.get("target_name", "")).strip() or default_target_name()
     public_if_created = args.public or bool(USER_CONFIG.get("public_target_if_created", False))
 
     all_playlists = get_all_user_playlists(sp)
     target = get_or_create_target_playlist(sp, target_name, public=public_if_created)
     target_id = target["id"]
+    if args.cover_image:
+        cover_image_path = resolve_cover_image_path(args.cover_image.strip())
+        set_playlist_cover_image(sp, target_id, cover_image_path)
 
     source_uris: List[str] = []
     added_count = 0
@@ -345,6 +389,8 @@ def main() -> None:
     print(f"Tracks added to target: {added_count}")
     print(f"Duplicate entries removed from target: {removed_count}")
     print(f"Tracks shuffled in target: {shuffled_count}")
+    if args.cover_image:
+        print(f"Cover image uploaded from script directory: {args.cover_image}")
 
 
 if __name__ == "__main__":
