@@ -1,4 +1,8 @@
 import re
+import sys
+import ast
+import io
+import tokenize
 from pathlib import Path
 
 # tool to lowercase all comments in source file, with dry-run mode to avoid accidental changes.
@@ -26,6 +30,76 @@ def lower_block(m): return '/*'   + m.group(1).lower() + '*/'
 def lower_slash(m): return re.sub(r'//(?![a-zA-Z0-9]).*', lambda x: x.group(0).lower(), m.group(0))
 def lower_hash(m):  return re.sub(r'#(?![0-9A-Fa-f]{3,6}).*', lambda x: x.group(0).lower(), m.group(0))
 
+
+def _docstring_positions_from_ast(text: str):
+    positions = set()
+    tree = ast.parse(text)
+
+    def add_if_docstring(body):
+        if not body:
+            return
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant):
+            if isinstance(first.value.value, str):
+                positions.add((first.lineno, first.col_offset, first.end_lineno, first.end_col_offset))
+
+    add_if_docstring(tree.body)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            add_if_docstring(node.body)
+
+    return positions
+
+
+def _lower_string_literal_content(token_text: str) -> str:
+    i = 0
+    while i < len(token_text) and token_text[i] in "rRuUbBfF":
+        i += 1
+    prefix = token_text[:i]
+    rest = token_text[i:]
+
+    quote = ""
+    if rest.startswith('"""') or rest.startswith("'''"):
+        quote = rest[:3]
+    elif rest.startswith('"') or rest.startswith("'"):
+        quote = rest[:1]
+    else:
+        return token_text
+
+    if not rest.endswith(quote):
+        return token_text
+
+    content = rest[len(quote) : -len(quote)]
+    return f"{prefix}{quote}{content.lower()}{quote}"
+
+
+def lower_python_comments_and_docstrings(text: str) -> str:
+    doc_pos = _docstring_positions_from_ast(text)
+    out_tokens = []
+
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        tok_type, tok_str, start, end, line = tok
+
+        if tok_type == tokenize.COMMENT:
+            if tok_str.startswith("#!"):
+                out_tokens.append(tok)
+            else:
+                out_tokens.append((tok_type, tok_str.lower(), start, end, line))
+            continue
+
+        if tok_type == tokenize.STRING:
+            key = (start[0], start[1], end[0], end[1])
+            if key in doc_pos:
+                lowered = _lower_string_literal_content(tok_str)
+                out_tokens.append((tok_type, lowered, start, end, line))
+            else:
+                out_tokens.append(tok)
+            continue
+
+        out_tokens.append(tok)
+
+    return tokenize.untokenize(out_tokens)
+
 def should_skip(path: Path) -> bool:
     if any(part in SKIP_DIRS for part in path.parts):
         return True
@@ -38,7 +112,7 @@ def debug_changes(filename, text_before, text_after):
     count = 0
     for i, (a, b) in enumerate(zip(text_before.splitlines(), text_after.splitlines()), start=1):
         if a != b:
-            print(f"  L{i:>4}: {a.strip()}  →  {b.strip()}")
+            print(f"  L{i:>4}: {a.strip()}  ->  {b.strip()}")
             count += 1
             if count > 5:
                 print("  ...more changes hidden...")
@@ -55,11 +129,14 @@ def process_file(f: Path):
     orig = text
 
     # apply transformations based on file type
-    text = PAT_HTML.sub(lower_html, text)
-    text = PAT_BLOCK.sub(lower_block, text)
+    if f.suffix == '.py':
+        text = lower_python_comments_and_docstrings(text)
+    else:
+        text = PAT_HTML.sub(lower_html, text)
+        text = PAT_BLOCK.sub(lower_block, text)
     if f.suffix in ('.js', '.ts', '.jsx', '.tsx'):
         text = PAT_SLASH.sub(lower_slash, text)
-    if f.suffix in ('.py', '.sh', '.rb'):
+    if f.suffix in ('.sh', '.rb'):
         text = PAT_HASH.sub(lower_hash, text)
 
     if text != orig:
@@ -74,8 +151,16 @@ def process_file(f: Path):
 
 # run
 if __name__ == "__main__":
-    for f in Path('.').rglob('*'):
-        process_file(f)
+    if len(sys.argv) < 2:
+        print("Usage: python l.py <file_path>")
+        sys.exit(1)
+
+    target = Path(sys.argv[1])
+    if not target.exists() or not target.is_file():
+        print(f"File not found: {target}")
+        sys.exit(1)
+
+    process_file(target)
 
     if DRY_RUN:
         print("\nDry-run mode ON — set DRY_RUN = False to actually save changes.")

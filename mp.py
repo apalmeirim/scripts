@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Merge tracks from all of your Spotify playlists into one destination playlist.
-+ deduplicates tracks by Spotify track ID.
+merge tracks from all of your spotify playlists into one destination playlist.
++ deduplicates tracks by spotify track id.
 
-Setup:
-1. Create a Spotify app at https://developer.spotify.com/dashboard
-2. Set redirect URI in app settings (recommended example: http://127.0.0.1:8888/callback)
-3. Create a local `.env` file in this folder with:
-   SPOTIPY_CLIENT_ID=...
-   SPOTIPY_CLIENT_SECRET=...
-   SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
-4. Install dependency (required!): pip install spotipy
+setup:
+1. create a spotify app at https://developer.spotify.com/dashboard
+2. set redirect uri in app settings (recommended example: http://127.0.0.1:8888/callback)
+3. create a local `.env` file in this folder with:
+   spotipy_client_id=...
+   spotipy_client_secret=...
+   spotipy_redirect_uri=http://127.0.0.1:8888/callback
+4. install dependency (required!): pip install spotipy
 
-Ex.:
+ex.:
 python mp.py --target-name "mp_result"
 
-Flags:
---target-name "NAME"       Destination playlist name (overrides USER_CONFIG target).
---public                   Create target as public if it does not already exist.
---include-target-source    Include target when scanning source playlists (merge mode).
---skip-dedup-target        Skip deduplication pass on target playlist.
---dedup-only               Skip merge/add; only deduplicate the target playlist.
---shuffle                  Shuffle the final target playlist order.
+flags:
+--target-name "name"       destination playlist name (overrides user_config target).
+--public                   create target as public if it does not already exist.
+--include-target-source    include target when scanning source playlists (merge mode).
+--skip-dedup-target        skip deduplication pass on target playlist.
+--dedup-only               skip merge/add; only deduplicate the target playlist.
+--shuffle                  shuffle the final target playlist order.
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ SCOPES = (
     "playlist-modify-public"
 )
 
-# MANDATORY: Fill these values with your Spotify app credentials.
+# mandatory: fill these values with your spotify app credentials.
 USER_CONFIG = {
-    "target_name": "mp_result",  # Your playlist name
+    "target_name": "mp_result",  # your playlist name
     "public_target_if_created": False,
 }
 
@@ -155,7 +155,7 @@ def extract_track_uri_and_id(item: dict) -> Tuple[Optional[str], Optional[str]]:
 
 
 def get_playlist_tracks_with_positions(sp: spotipy.Spotify, playlist_id: str) -> List[Tuple[int, str, str]]:
-    """Returns (position, uri, track_id) for tracks in a playlist."""
+    """returns (position, uri, track_id) for tracks in a playlist."""
     rows: List[Tuple[int, str, str]] = []
     offset = 0
 
