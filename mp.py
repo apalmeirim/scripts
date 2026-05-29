@@ -34,6 +34,7 @@ from datetime import date
 import os
 from pathlib import Path
 import random
+import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import spotipy
@@ -193,29 +194,67 @@ def extract_track_uri_and_id(item: dict) -> Tuple[Optional[str], Optional[str]]:
     return uri, track_id
 
 
-def get_playlist_tracks_with_positions(sp: spotipy.Spotify, playlist_id: str) -> List[Tuple[int, str, str]]:
-    """returns (position, uri, track_id) for tracks in a playlist."""
-    rows: List[Tuple[int, str, str]] = []
-    offset = 0
+def normalize_text(value: str) -> str:
+    return " ".join(value.lower().strip().split())
 
+
+def normalize_title(value: str) -> str:
+    text = normalize_text(value)
+    text = re.sub(r"\s*[\(\[].*?[\)\]]\s*", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def build_semantic_key(track: dict) -> Optional[Tuple[str, str, int]]:
+    name = track.get("name") or ""
+    artists = track.get("artists") or []
+    duration_ms = track.get("duration_ms")
+    if not name or not artists or not isinstance(duration_ms, int):
+        return None
+    artist_names = [normalize_text(a.get("name", "")) for a in artists if a.get("name")]
+    if not artist_names:
+        return None
+    title_key = normalize_title(name)
+    artists_key = "|".join(artist_names)
+    duration_bucket = int(round(duration_ms / 2000.0))
+    return (title_key, artists_key, duration_bucket)
+
+
+def get_playlist_track_rows(sp: spotipy.Spotify, playlist_id: str) -> List[dict]:
+    rows: List[dict] = []
+    offset = 0
     while True:
         results = sp.playlist_items(
             playlist_id,
             offset=offset,
             limit=100,
-            fields="items(track(id,uri)),next",
+            fields="items(track(id,uri,name,duration_ms,artists(name))),next",
         )
         items = results.get("items", [])
         for idx, item in enumerate(items):
+            track = item.get("track") or {}
             uri, track_id = extract_track_uri_and_id(item)
-            if uri and track_id:
-                rows.append((offset + idx, uri, track_id))
+            if not uri or not track_id:
+                continue
+            rows.append(
+                {
+                    "position": offset + idx,
+                    "uri": uri,
+                    "track_id": track_id,
+                    "semantic_key": build_semantic_key(track),
+                }
+            )
 
         if not results.get("next"):
             break
         offset += len(items)
-
     return rows
+
+
+def get_playlist_tracks_with_positions(sp: spotipy.Spotify, playlist_id: str) -> List[Tuple[int, str, str]]:
+    """returns (position, uri, track_id) for tracks in a playlist."""
+    rows = get_playlist_track_rows(sp, playlist_id)
+    return [(r["position"], r["uri"], r["track_id"]) for r in rows]
 
 
 def get_unique_source_track_uris(
@@ -278,23 +317,32 @@ def add_missing_tracks_to_target(
 
 
 def dedup_playlist_in_place(sp: spotipy.Spotify, playlist_id: str) -> int:
-    rows = get_playlist_tracks_with_positions(sp, playlist_id)
-    seen: Set[str] = set()
-    duplicates_by_uri: Dict[str, List[int]] = defaultdict(list)
-
-    for position, uri, track_id in rows:
-        if track_id in seen:
-            duplicates_by_uri[uri].append(position)
-        else:
-            seen.add(track_id)
-
     total_removed = 0
-    removals: List[dict] = []
-    for uri, positions in duplicates_by_uri.items():
-        for pos in positions:
-            removals.append({"uri": uri, "positions": [pos]})
+    while True:
+        rows = get_playlist_track_rows(sp, playlist_id)
+        seen_track_ids: Set[str] = set()
+        seen_semantic_keys: Set[Tuple[str, str, int]] = set()
+        removals: List[dict] = []
 
-    for batch in chunked(removals, 100):
+        for row in rows:
+            position = row["position"]
+            uri = row["uri"]
+            track_id = row["track_id"]
+            semantic_key = row["semantic_key"]
+            duplicate_by_id = track_id in seen_track_ids
+            duplicate_by_semantic = bool(semantic_key and semantic_key in seen_semantic_keys)
+            if duplicate_by_id or duplicate_by_semantic:
+                removals.append({"uri": uri, "positions": [position]})
+            else:
+                seen_track_ids.add(track_id)
+                if semantic_key:
+                    seen_semantic_keys.add(semantic_key)
+
+        if not removals:
+            break
+
+        # Positions are snapshot-sensitive; remove at most 100, then recompute.
+        batch = removals[:100]
         sp.playlist_remove_specific_occurrences_of_items(playlist_id, batch)
         total_removed += len(batch)
 
