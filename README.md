@@ -1,3 +1,3 @@
-A folder with Python scripts to help do random tasks.
-
-l - lowercaseing all comments in any file.
+**scripts**:
+l - lowercaseing all comments in any file
+mp - union of all spotify playlists
